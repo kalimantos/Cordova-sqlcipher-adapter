@@ -670,7 +670,7 @@ Documentation at: http://ngcordova.com/docs/plugins/sqlite/
 
     npm install -g cordova # (in case you don't have cordova)
     cordova create MyProjectFolder com.my.project MyProject && cd MyProjectFolder # if you are just starting
-    cordova plugin add https://github.com/litehelpers/Cordova-sqlcipher-adapter
+    cordova plugin add https://github.com/kalimantos/Cordova-sqlcipher-adapter
 
 **CLI NOTES:**
 
@@ -687,7 +687,7 @@ You can find some more details in a nice writeup (though with old links and pack
 ## Easy install with plugman tool
 
 ```shell
-plugman install --platform MYPLATFORM --project path.to.my.project.folder --plugin https://github.com/litehelpers/Cordova-sqlcipher-adapter
+plugman install --platform MYPLATFORM --project path.to.my.project.folder --plugin https://github.com/kalimantos/Cordova-sqlcipher-adapter
 ```
 
 where MYPLATFORM is `android`, `ios`, or `windows`.
