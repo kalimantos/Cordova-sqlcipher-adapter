@@ -1,10 +1,10 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <plugin xmlns="http://www.phonegap.com/ns/plugins/1.0"
     xmlns:android="http://schemas.android.com/apk/res/android"
-    id="cordova-sqlcipher-adapter"
-    version="0.1.6">
+    id="cordova-sqlcipher-ios-memory-leak-fix"
+    version="1.0.0">
 
-    <name>Cordova sqlcipher adapter</name>
+    <name>Cordova sqlcipher adapter edited to solve ios memory issues ;)</name>
 
     <license>MIT</license>
 
@@ -12,7 +12,7 @@
 
     <description>SQLCipher database adapter for PhoneGap/Cordova, based on Cordova-sqlite-storage. Allows you to use more storage and provides more flexibility than the standard Web SQL database (window.openDatabase).</description>
 
-    <author>Litehelpers/Various</author>
+    <author>Litehelpers/Various edited by kalimantos</author>
 
     <!-- No longer enforced:
     <engines>

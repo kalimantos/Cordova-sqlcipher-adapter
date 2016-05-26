@@ -2,18 +2,15 @@
  * Copyright (c) 2012-2016: Christopher J. Brody (aka Chris Brody)
  * Copyright (C) 2011 Davide Bertola
  *
- * This library is available under the terms of the MIT License (2008).
- * See http://opensource.org/licenses/alphabetical for full text.
+ * License for this version: GPL v3 (http://www.gnu.org/licenses/gpl.txt) or commercial license.
+ * Contact for commercial license: info@litehelpers.net
  */
 
 #import "SQLitePlugin.h"
 
 #import "sqlite3.h"
 
-#if 0
-// REGEXP:
 #include <regex.h>
-#endif
 
 // NOTE: This is now broken by cordova-ios 4.0, see:
 // https://issues.apache.org/jira/browse/CB-9638
@@ -22,7 +19,6 @@
 #import <Cordova/NSData+Base64.h>
 #endif
 
-#if 0
 static void
 sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     if ( argc < 2 ) {
@@ -52,7 +48,6 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
 
     sqlite3_result_int(context, (ret != REG_NOMATCH));
 }
-#endif
 
 
 @implementation SQLitePlugin
@@ -119,23 +114,30 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     return dbPath;
 }
 
--(void)echoStringValue: (CDVInvokedUrlCommand*)command
+// XXX NOTE: This implementation gets _all_ operations working in the background
+// and _should_ resolve intermittent problems reported with cordova-ios@4.0.1).
+// This implementation _does_ fail certain rapidly repeated
+// open-and close and open-and-delete test scenarios.
+-(void)executeInBackground: (CDVInvokedUrlCommand*)command
 {
-    CDVPluginResult * pluginResult = nil;
-    NSMutableDictionary * options = [command.arguments objectAtIndex:0];
-
-    NSString * string_value = [options objectForKey:@"value"];
-
-    NSLog(@"echo string value: %@", string_value);
-
-    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:string_value];
-    [self.commandDelegate sendPluginResult:pluginResult callbackId: command.callbackId];
+    [self.commandDelegate runInBackground:^{
+        @synchronized(self) {
+            if ([command.methodName isEqualToString: @"open"])
+                [self openNow: command];
+            else if ([command.methodName isEqualToString: @"close"])
+                [self closeNow: command];
+            else if ([command.methodName isEqualToString: @"delete"])
+                [self deleteNow: command];
+            else if ([command.methodName isEqualToString: @"backgroundExecuteSqlBatch"])
+                [self executeSqlBatchNow: command];
+        }
+    }];
 }
 
 -(void)open: (CDVInvokedUrlCommand*)command
 {
     [self.commandDelegate runInBackground:^{
-        [self openNow: command];
+        [self executeInBackground: command];
     }];
 }
 
@@ -168,32 +170,31 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
 
             NSLog(@"open full db path: %@", dbname);
 
-            // NOTE: create DB from resource [pre-populated] NOT supported with sqlcipher.
+            /* Option to create database from resource (pre-populated) if it does not exist: */
+            if (![[NSFileManager defaultManager] fileExistsAtPath: dbname]) {
+                NSString * createFromResource = [options objectForKey:@"createFromResource"];
+                if (createFromResource != NULL)
+                    [self createFromResource: dbfilename withDbname: dbname];
+            }
 
             if (sqlite3_open(name, &db) != SQLITE_OK) {
                 pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Unable to open DB"];
                 return;
             } else {
-#if 0
                 sqlite3_create_function(db, "REGEXP", 2, SQLITE_ANY, NULL, &sqlite_regexp, NULL, NULL);
-#endif
 
-                // SQLCipher key:
+                // for SQLCipher version:
                 NSString *dbkey = [options objectForKey:@"key"];
                 const char *key = NULL;
-                if (dbkey != NULL && dbkey.length != 0) key = [dbkey UTF8String];
-                NSLog((key != NULL) ? @"Open DB with encryption" : @"Open DB with NO encryption");
+                if (dbkey != NULL) key = [dbkey UTF8String];
                 if (key != NULL) sqlite3_key(db, key, strlen(key));
 
-                // XXX Brody TODO check this in Javascript instead.
                 // Attempt to read the SQLite master table [to support SQLCipher version]:
                 if(sqlite3_exec(db, (const char*)"SELECT count(*) FROM sqlite_master;", NULL, NULL, NULL) == SQLITE_OK) {
-                    NSLog(@"DB open, check sqlite master table OK");
                     dbPointer = [NSValue valueWithPointer:db];
                     [openDBs setObject: dbPointer forKey: dbfilename];
-                    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"Database opened"];
+                    pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsString:@"a1i"];
                 } else {
-                    NSLog(@"ERROR reading sqlite master table");
                     pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"Unable to open DB with key"];
                     // XXX TODO: close the db handle & [perhaps] remove from openDBs!!
                 }
@@ -213,10 +214,28 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     // NSLog(@"open cb finished ok");
 }
 
+-(void) createFromResource: (NSString *)dbfile withDbname:(NSString *)dbname {
+    NSString * bundleRoot = [[NSBundle mainBundle] resourcePath];
+    NSString * www = [bundleRoot stringByAppendingPathComponent:@"www"];
+    NSString * prepopulatedDb = [www stringByAppendingPathComponent: dbfile];
+    // NSLog(@"Look for pre-populated DB at: %@", prepopulatedDb);
+
+    if ([[NSFileManager defaultManager] fileExistsAtPath:prepopulatedDb]) {
+        NSLog(@"Found prepopulated DB: %@", prepopulatedDb);
+        NSError * error;
+        BOOL success = [[NSFileManager defaultManager] copyItemAtPath:prepopulatedDb toPath:dbname error:&error];
+
+        if(success)
+            NSLog(@"Copied pre-populated DB content to: %@", dbname);
+        else
+            NSLog(@"Unable to copy pre-populated DB file: %@", [error localizedDescription]);
+    }
+}
+
 -(void) close: (CDVInvokedUrlCommand*)command
 {
     [self.commandDelegate runInBackground:^{
-        [self closeNow: command];
+        [self executeInBackground: command];
     }];
 }
 
@@ -254,7 +273,7 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
 -(void) delete: (CDVInvokedUrlCommand*)command
 {
     [self.commandDelegate runInBackground:^{
-        [self deleteNow: command];
+        [self executeInBackground: command];
     }];
 }
 
@@ -301,29 +320,24 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     NSMutableDictionary *options = [command.arguments objectAtIndex:0];
     NSMutableArray *results = [NSMutableArray arrayWithCapacity:0];
     NSMutableDictionary *dbargs = [options objectForKey:@"dbargs"];
-    NSMutableArray *executes = [options objectForKey:@"executes"];
+    NSNumber *flen = [options objectForKey:@"flen"];
+    NSMutableArray *flatlist = [options objectForKey:@"flatlist"];
+    int sc = [flen integerValue];
+
+    NSString *dbFileName = [dbargs objectForKey:@"dbname"];
 
     CDVPluginResult* pluginResult;
 
+    int ai = 0;
+
     @synchronized(self) {
-        for (NSMutableDictionary *dict in executes) {
-            CDVPluginResult *result = [self executeSqlWithDict:dict andArgs:dbargs];
-            if ([result.status intValue] == CDVCommandStatus_ERROR) {
-                /* add error with result.message: */
-                NSMutableDictionary *r = [NSMutableDictionary dictionaryWithCapacity:0];
-                [r setObject:[dict objectForKey:@"qid"] forKey:@"qid"];
-                [r setObject:@"error" forKey:@"type"];
-                [r setObject:result.message forKey:@"error"];
-                [r setObject:result.message forKey:@"result"];
-                [results addObject: r];
-            } else {
-                /* add result with result.message: */
-                NSMutableDictionary *r = [NSMutableDictionary dictionaryWithCapacity:0];
-                [r setObject:[dict objectForKey:@"qid"] forKey:@"qid"];
-                [r setObject:@"success" forKey:@"type"];
-                [r setObject:result.message forKey:@"result"];
-                [results addObject: r];
-            }
+        for (int i=0; i<sc; ++i) {
+            NSString *sql = [flatlist objectAtIndex:(ai++)];
+            NSNumber *pc = [flatlist objectAtIndex:(ai++)];
+            int params_count = [pc integerValue];
+
+            [self executeSql:sql withParams:flatlist first:ai count:params_count onDatabaseName:dbFileName results:results];
+            ai += params_count;
         }
 
         pluginResult = [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsArray:results];
@@ -332,87 +346,73 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
 }
 
--(void) backgroundExecuteSql: (CDVInvokedUrlCommand*)command
+-(void)executeSql: (NSString*)sql withParams: (NSMutableArray*)params first: (int)first count:(int)params_count onDatabaseName: (NSString*)dbFileName results: (NSMutableArray*)results
 {
-    [self.commandDelegate runInBackground:^{
-        [self executeSql:command];
-    }];
-}
-
--(void) executeSql: (CDVInvokedUrlCommand*)command
-{
-    NSMutableDictionary *options = [command.arguments objectAtIndex:0];
-    NSMutableDictionary *dbargs = [options objectForKey:@"dbargs"];
-    NSMutableDictionary *ex = [options objectForKey:@"ex"];
-
-    CDVPluginResult* pluginResult;
-    @synchronized (self) {
-        pluginResult = [self executeSqlWithDict: ex andArgs: dbargs];
-    }
-    [self.commandDelegate sendPluginResult:pluginResult callbackId:command.callbackId];
-}
-
--(CDVPluginResult*) executeSqlWithDict: (NSMutableDictionary*)options andArgs: (NSMutableDictionary*)dbargs
-{
-    NSString *dbFileName = [dbargs objectForKey:@"dbname"];
+#if 0 // XXX TODO check in executeSqlBatch: [should NEVER occur]:
     if (dbFileName == NULL) {
         return [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"You must specify database path"];
     }
-
-    NSMutableArray *params = [options objectForKey:@"params"]; // optional
+#endif
 
     NSValue *dbPointer = [openDBs objectForKey:dbFileName];
+
+#if 0 // XXX TODO check in executeSqlBatch: [should NEVER occur]:
     if (dbPointer == NULL) {
         return [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"No such database, you must open it first"];
     }
-    sqlite3 *db = [dbPointer pointerValue];
+#endif
 
-    NSString *sql = [options objectForKey:@"sql"];
-    if (sql == NULL) {
-        return [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsString:@"You must specify a sql query to execute"];
-    }
+    sqlite3 *db = [dbPointer pointerValue];
 
     const char *sql_stmt = [sql UTF8String];
     NSDictionary *error = nil;
     sqlite3_stmt *statement;
     int result, i, column_type, count;
     int previousRowsAffected, nowRowsAffected, diffRowsAffected;
-    long long previousInsertId, nowInsertId;
+    long long nowInsertId;
     BOOL keepGoing = YES;
     BOOL hasInsertId;
-    NSMutableDictionary *resultSet = [NSMutableDictionary dictionaryWithCapacity:0];
+
     NSMutableArray *resultRows = [NSMutableArray arrayWithCapacity:0];
     NSMutableDictionary *entry;
     NSObject *columnValue;
+    NSString *columnStringValue;
     NSString *columnName;
     NSObject *insertId;
     NSObject *rowsAffected;
 
     hasInsertId = NO;
     previousRowsAffected = sqlite3_total_changes(db);
-    previousInsertId = sqlite3_last_insert_rowid(db);
 
     if (sqlite3_prepare_v2(db, sql_stmt, -1, &statement, NULL) != SQLITE_OK) {
         error = [SQLitePlugin captureSQLiteErrorFromDb:db];
         keepGoing = NO;
     } else if (params != NULL) {
-        for (int b = 0; b < params.count; b++) {
-            [self bindStatement:statement withArg:[params objectAtIndex:b] atIndex:(b+1)];
+        for (int b = 0; b < params_count; b++) {
+            [self bindStatement:statement withArg:[params objectAtIndex:(first+b)] atIndex:(b+1)];
         }
     }
+
+    BOOL hasRows = NO;
 
     while (keepGoing) {
         result = sqlite3_step (statement);
         switch (result) {
 
             case SQLITE_ROW:
+                if (!hasRows) [results addObject:@"okrows"];
+                hasRows = YES;
                 i = 0;
                 entry = [NSMutableDictionary dictionaryWithCapacity:0];
                 count = sqlite3_column_count(statement);
 
+                [results addObject:[NSNumber numberWithInt:count]];
+
                 while (i < count) {
                     columnValue = nil;
                     columnName = [NSString stringWithFormat:@"%s", sqlite3_column_name(statement, i)];
+
+                    [results addObject:columnName];
 
                     column_type = sqlite3_column_type(statement, i);
                     switch (column_type) {
@@ -423,21 +423,14 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
                             columnValue = [NSNumber numberWithDouble: sqlite3_column_double(statement, i)];
                             break;
                         case SQLITE_BLOB:
-#ifdef READ_BLOB_AS_BASE64
-                            columnValue = [SQLitePlugin getBlobAsBase64String: sqlite3_column_blob(statement, i)
-                                                        withLength: sqlite3_column_bytes(statement, i)];
-#ifdef INCLUDE_SQL_BLOB_BINDING // TBD subjet to change:
-                            columnValue = [@"sqlblob:;base64," stringByAppendingString:columnValue];
-#endif
-                            break;
-#endif // else
                         case SQLITE_TEXT:
-                            columnValue = [[NSString alloc] initWithBytes:(char *)sqlite3_column_text(statement, i)
+                            columnStringValue = [[NSString alloc] initWithBytes:(char *)sqlite3_column_text(statement, i)
                                                                    length:sqlite3_column_bytes(statement, i)
                                                                  encoding:NSUTF8StringEncoding];
 #if !__has_feature(objc_arc)
-                            [columnValue autorelease];
+                            [columnStringValue autorelease];
 #endif
+                            columnValue = [columnStringValue stringByAddingPercentEscapesUsingEncoding:NSUTF8StringEncoding];
                             break;
                         case SQLITE_NULL:
                         // just in case (should not happen):
@@ -446,9 +439,7 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
                             break;
                     }
 
-                    if (columnValue) {
-                        [entry setObject:columnValue forKey:columnName];
-                    }
+                    [results addObject:columnValue];
 
                     i++;
                 }
@@ -456,14 +447,16 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
                 break;
 
             case SQLITE_DONE:
+                if (hasRows) [results addObject:@"endrows"];
                 nowRowsAffected = sqlite3_total_changes(db);
                 diffRowsAffected = nowRowsAffected - previousRowsAffected;
                 rowsAffected = [NSNumber numberWithInt:diffRowsAffected];
                 nowInsertId = sqlite3_last_insert_rowid(db);
                 if (nowRowsAffected > 0 && nowInsertId != 0) {
                     hasInsertId = YES;
-                    insertId = [NSNumber numberWithLongLong:sqlite3_last_insert_rowid(db)];
+                    insertId = [NSNumber numberWithLongLong:nowInsertId];
                 }
+                else insertId = [NSNumber numberWithLongLong:-1];
                 keepGoing = NO;
                 break;
 
@@ -476,15 +469,21 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     sqlite3_finalize (statement);
 
     if (error) {
-        return [CDVPluginResult resultWithStatus:CDVCommandStatus_ERROR messageAsDictionary:error];
+        /* add error with result.message: */
+
+        [results addObject:@"error"];
+        [results addObject:[error objectForKey:@"code"]];
+        [results addObject:[error objectForKey:@"sqliteCode"]];
+        [results addObject:[error objectForKey:@"message"]];
+
+        return;
     }
 
-    [resultSet setObject:resultRows forKey:@"rows"];
-    [resultSet setObject:rowsAffected forKey:@"rowsAffected"];
-    if (hasInsertId) {
-        [resultSet setObject:insertId forKey:@"insertId"];
+    if (!hasRows) {
+        [results addObject:@"ch2"];
+        [results addObject:rowsAffected];
+        [results addObject:insertId];
     }
-    return [CDVPluginResult resultWithStatus:CDVCommandStatus_OK messageAsDictionary:resultSet];
 }
 
 -(void)bindStatement:(sqlite3_stmt *)statement withArg:(NSObject *)arg atIndex:(int)argIndex
@@ -511,23 +510,6 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
             stringArg = [arg description]; // convert to text
         }
 
-#ifdef INCLUDE_SQL_BLOB_BINDING // TBD subjet to change:
-        // If the string is a sqlblob URI then decode it and store the binary directly.
-        //
-        // A sqlblob URI is formatted similar to a data URI which makes it easy to convert:
-        //   sqlblob:[<mime type>][;charset=<charset>][;base64],<encoded data>
-        //
-        // The reason the `sqlblob` prefix is used instead of `data` is because
-        // applications may want to use data URI strings directly, so the
-        // `sqlblob` prefix disambiguates the desired behavior.
-        if ([stringArg hasPrefix:@"sqlblob:"]) {
-            // convert to data URI, decode, store as blob
-            stringArg = [stringArg stringByReplacingCharactersInRange:NSMakeRange(0,7) withString:@"data"];
-            NSData *data = [NSData dataWithContentsOfURL: [NSURL URLWithString:stringArg]];
-            sqlite3_bind_blob(statement, argIndex, data.bytes, data.length, SQLITE_TRANSIENT);
-        }
-        else
-#endif
         {
             NSData *data = [stringArg dataUsingEncoding:NSUTF8StringEncoding];
             sqlite3_bind_text(statement, argIndex, data.bytes, (int)data.length, SQLITE_TRANSIENT);
@@ -562,7 +544,7 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
 {
     int code = sqlite3_errcode(db);
     int webSQLCode = [SQLitePlugin mapSQLiteErrorCode:code];
-#if INCLUDE_SQLITE_ERROR_INFO
+#if 0 // XXX NOT SUPPORTED IN THIS VERSION:
     int extendedCode = sqlite3_extended_errcode(db);
 #endif
     const char *message = sqlite3_errmsg(db);
@@ -572,8 +554,8 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
     [error setObject:[NSNumber numberWithInt:webSQLCode] forKey:@"code"];
     [error setObject:[NSString stringWithUTF8String:message] forKey:@"message"];
 
-#if INCLUDE_SQLITE_ERROR_INFO
     [error setObject:[NSNumber numberWithInt:code] forKey:@"sqliteCode"];
+#if 0 // XXX NOT SUPPORTED IN THIS VERSION:
     [error setObject:[NSNumber numberWithInt:extendedCode] forKey:@"sqliteExtendedCode"];
     [error setObject:[NSString stringWithUTF8String:message] forKey:@"sqliteMessage"];
 #endif
@@ -596,24 +578,5 @@ sqlite_regexp(sqlite3_context * context, int argc, sqlite3_value ** values) {
             return UNKNOWN_ERR;
     }
 }
-
-#ifdef READ_BLOB_AS_BASE64
-+(NSString*)getBlobAsBase64String:(const char*)blob_chars
-                       withLength:(int)blob_length
-{
-    size_t outputLength = 0;
-    char* outputBuffer = CDVNewBase64Encode(blob_chars, blob_length, true, &outputLength);
-
-    NSString* result = [[NSString alloc] initWithBytesNoCopy:outputBuffer
-                                                      length:outputLength
-                                                    encoding:NSASCIIStringEncoding
-                                                freeWhenDone:YES];
-#if !__has_feature(objc_arc)
-    [result autorelease];
-#endif
-
-    return result;
-}
-#endif
 
 @end /* vim: set expandtab : */

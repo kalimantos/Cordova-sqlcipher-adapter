@@ -1,5 +1,5 @@
 (function() {
-  var DB_STATE_INIT, DB_STATE_OPEN, READ_ONLY_REGEX, SQLiteFactory, SQLitePlugin, SQLitePluginTransaction, argsArray, dblocations, iosLocationMap, newSQLError, nextTick, root, txLocks;
+  var DB_STATE_INIT, DB_STATE_OPEN, MAX_SQL_CHUNK, READ_ONLY_REGEX, SQLiteFactory, SQLitePlugin, SQLitePluginTransaction, argsArray, dblocations, newSQLError, nextTick, resulturiencoding, root, txLocks, useflatjson;
 
   root = this;
 
@@ -9,7 +9,19 @@
 
   DB_STATE_OPEN = "OPEN";
 
+
+  /*
+  OPTIONAL: Transaction SQL chunking
+  MAX_SQL_CHUNK is adjustable, set to 0 (or -1) to disable chunking
+   */
+
+  MAX_SQL_CHUNK = 0;
+
   txLocks = {};
+
+  useflatjson = false;
+
+  resulturiencoding = false;
 
   newSQLError = function(error, code) {
     var sqlError;
@@ -109,6 +121,22 @@
     }
   };
 
+  SQLitePlugin.prototype.beginTransaction = function(error) {
+    var myfn, mytx;
+    if (!this.openDBs[this.dbname]) {
+      throw newSQLError('database not open');
+    }
+    myfn = function(tx) {};
+    mytx = new SQLitePluginTransaction(this, myfn, error, null, false, false);
+    mytx.canPause = true;
+    mytx.addStatement("BEGIN", [], null, function(tx, err) {
+      throw newSQLError("unable to begin transaction: " + err.message, err.code);
+    });
+    mytx.txlock = true;
+    this.addTransaction(mytx);
+    return mytx;
+  };
+
   SQLitePlugin.prototype.transaction = function(fn, error, success) {
     if (!this.openDBs[this.dbname]) {
       error(newSQLError('database not open'));
@@ -148,12 +176,12 @@
   };
 
   SQLitePlugin.prototype.abortAllPendingTransactions = function() {
-    var j, len1, ref, tx, txLock;
+    var l, len1, ref, tx, txLock;
     txLock = txLocks[this.dbname];
     if (!!txLock && txLock.queue.length > 0) {
       ref = txLock.queue;
-      for (j = 0, len1 = ref.length; j < len1; j++) {
-        tx = ref[j];
+      for (l = 0, len1 = ref.length; l < len1; l++) {
+        tx = ref[l];
         tx.abortFromQ(newSQLError('Invalid database handle'));
       }
       txLock.queue = [];
@@ -173,8 +201,17 @@
     } else {
       console.log('OPEN database: ' + this.dbname);
       opensuccesscb = (function(_this) {
-        return function() {
+        return function(a1) {
           var txLock;
+          console.log('OPEN database: ' + _this.dbname + ' OK');
+          if (!!a1 && (a1 === 'a1' || a1 === 'a1i')) {
+            console.log('Detected Android/iOS version with flat JSON interface');
+            useflatjson = true;
+            if (a1 === 'a1i') {
+              console.log('with result uri encoding');
+              resulturiencoding = true;
+            }
+          }
           if (!_this.openDBs[_this.dbname]) {
             console.log('database was closed during open operation');
           }
@@ -252,41 +289,6 @@
     this.addTransaction(new SQLitePluginTransaction(this, myfn, null, null, false, false));
   };
 
-  SQLitePlugin.prototype.sqlBatch = function(sqlStatements, success, error) {
-    var batchList, j, len1, myfn, st;
-    if (!sqlStatements || sqlStatements.constructor !== Array) {
-      throw newSQLError('sqlBatch expects an array');
-    }
-    batchList = [];
-    for (j = 0, len1 = sqlStatements.length; j < len1; j++) {
-      st = sqlStatements[j];
-      if (st.constructor === Array) {
-        if (st.length === 0) {
-          throw newSQLError('sqlBatch array element of zero (0) length');
-        }
-        batchList.push({
-          sql: st[0],
-          params: st.length === 0 ? [] : st[1]
-        });
-      } else {
-        batchList.push({
-          sql: st,
-          params: []
-        });
-      }
-    }
-    myfn = function(tx) {
-      var elem, k, len2, results;
-      results = [];
-      for (k = 0, len2 = batchList.length; k < len2; k++) {
-        elem = batchList[k];
-        results.push(tx.addStatement(elem.sql, elem.params, null, null));
-      }
-      return results;
-    };
-    this.addTransaction(new SQLitePluginTransaction(this, myfn, error, success, true, false));
-  };
-
   SQLitePluginTransaction = function(db, fn, error, success, txlock, readOnly) {
     if (typeof fn !== "function") {
 
@@ -304,13 +306,13 @@
     this.success = success;
     this.txlock = txlock;
     this.readOnly = readOnly;
+    this.canPause = false;
+    this.isPaused = false;
     this.executes = [];
     if (txlock) {
       this.addStatement("BEGIN", [], null, function(tx, err) {
         throw newSQLError("unable to begin transaction: " + err.message, err.code);
       });
-    } else {
-      this.addStatement("SELECT 1", [], null, null);
     }
   };
 
@@ -318,7 +320,9 @@
     var err, error1;
     try {
       this.fn(this);
-      this.run();
+      if (this.executes.length > 0) {
+        this.run();
+      }
     } catch (error1) {
       err = error1;
       txLocks[this.db.dbname].inProgress = false;
@@ -344,14 +348,48 @@
       return;
     }
     this.addStatement(sql, values, success, error);
+    if (this.isPaused) {
+      this.isPaused = false;
+      this.run();
+    }
+  };
+
+  SQLitePluginTransaction.prototype.end = function(success, error) {
+    if (!this.canPause) {
+      throw newSQLError('Sorry invalid usage');
+    }
+    this.canPause = false;
+    this.success = success;
+    this.error = error;
+    if (this.isPaused) {
+      this.isPaused = false;
+      if (this.executes.length === 0) {
+        this.$finish();
+      } else {
+        this.run();
+      }
+    }
+  };
+
+  SQLitePluginTransaction.prototype.abort = function(errorcb) {
+    if (!this.canPause) {
+      throw newSQLError('Sorry invalid usage');
+    }
+    this.canPause = false;
+    this.error = errorcb;
+    this.addStatement('INVALID STATEMENT', [], null, null);
+    if (this.isPaused) {
+      this.isPaused = false;
+      this.run();
+    }
   };
 
   SQLitePluginTransaction.prototype.addStatement = function(sql, values, success, error) {
-    var j, len1, params, t, v;
+    var l, len1, params, t, v;
     params = [];
     if (!!values && values.constructor === Array) {
-      for (j = 0, len1 = values.length; j < len1; j++) {
-        v = values[j];
+      for (l = 0, len1 = values.length; l < len1; l++) {
+        v = values[l];
         t = typeof v;
         params.push((v === null || v === void 0 || t === 'number' || t === 'string' ? v : v instanceof Blob ? v.valueOf() : v.toString()));
       }
@@ -362,6 +400,9 @@
       sql: sql,
       params: params
     });
+    if (MAX_SQL_CHUNK > 0 && this.executes.length > MAX_SQL_CHUNK) {
+      this.run();
+    }
   };
 
   SQLitePluginTransaction.prototype.handleStatementSuccess = function(handler, response) {
@@ -393,21 +434,25 @@
   };
 
   SQLitePluginTransaction.prototype.run = function() {
-    var batchExecutes, handlerFor, i, mycb, mycbmap, request, tropts, tx, txFailure, waiting;
+    var batchExecutes, handlerFor, tx, txFailure, waiting;
     txFailure = null;
-    tropts = [];
     batchExecutes = this.executes;
     waiting = batchExecutes.length;
     this.executes = [];
     tx = this;
     handlerFor = function(index, didSucceed) {
       return function(response) {
-        var err, error1;
+        var err, error1, sqlError;
         try {
           if (didSucceed) {
             tx.handleStatementSuccess(batchExecutes[index].success, response);
           } else {
-            tx.handleStatementFailure(batchExecutes[index].error, newSQLError(response));
+            sqlError = newSQLError(response);
+            if (!!response.result) {
+              sqlError.code = response.result.code;
+              sqlError.sqliteCode = response.result.sqliteCode;
+            }
+            tx.handleStatementFailure(batchExecutes[index].error, sqlError);
           }
         } catch (error1) {
           err = error1;
@@ -417,17 +462,127 @@
         }
         if (--waiting === 0) {
           if (txFailure) {
-            tx.abort(txFailure);
+            tx.$abort(txFailure);
           } else if (tx.executes.length > 0) {
             tx.run();
+          } else if (tx.canPause) {
+            tx.isPaused = true;
           } else {
-            tx.finish();
+            tx.$finish();
           }
         }
       };
     };
-    i = 0;
+    if (useflatjson) {
+      this.run_batch_flatjson(batchExecutes, handlerFor);
+    } else {
+      this.run_batch(batchExecutes, handlerFor);
+    }
+  };
+
+  SQLitePluginTransaction.prototype.run_batch_flatjson = function(batchExecutes, handlerFor) {
+    var flatlist, i, l, len1, mycb, mycbmap, p, ref, request;
+    flatlist = [];
     mycbmap = {};
+    i = 0;
+    while (i < batchExecutes.length) {
+      request = batchExecutes[i];
+      mycbmap[i] = {
+        success: handlerFor(i, true),
+        error: handlerFor(i, false)
+      };
+      flatlist.push(request.sql);
+      flatlist.push(request.params.length);
+      ref = request.params;
+      for (l = 0, len1 = ref.length; l < len1; l++) {
+        p = ref[l];
+        flatlist.push(p);
+      }
+      i++;
+    }
+    mycb = function(result) {
+      var c, changes, code, errormessage, insert_id, j, k, q, r, ri, rl, row, rows, sqliteCode, v;
+      i = 0;
+      ri = 0;
+      rl = result.length;
+      while (ri < rl) {
+        r = result[ri++];
+        q = mycbmap[i];
+        if (r === 'ok') {
+          q.success({
+            rows: []
+          });
+        } else if (r === "ch2") {
+          changes = result[ri++];
+          insert_id = result[ri++];
+          q.success({
+            rowsAffected: changes,
+            insertId: insert_id
+          });
+        } else if (r === 'okrows') {
+          rows = [];
+          changes = 0;
+          insert_id = void 0;
+          if (result[ri] === 'changes') {
+            ++ri;
+            changes = result[ri++];
+          }
+          if (result[ri] === 'insert_id') {
+            ++ri;
+            insert_id = result[ri++];
+          }
+          while (result[ri] !== 'endrows') {
+            c = result[ri++];
+            j = 0;
+            row = {};
+            while (j < c) {
+              k = result[ri++];
+              v = result[ri++];
+              if (resulturiencoding && typeof v === 'string') {
+                v = decodeURIComponent(v);
+              }
+              row[k] = v;
+              ++j;
+            }
+            rows.push(row);
+          }
+          q.success({
+            rows: rows,
+            rowsAffected: changes,
+            insertId: insert_id
+          });
+          ++ri;
+        } else if (r === 'error') {
+          code = result[ri++];
+          sqliteCode = result[ri++];
+          errormessage = result[ri++];
+          q.error({
+            result: {
+              code: code,
+              sqliteCode: sqliteCode,
+              message: errormessage
+            }
+          });
+        }
+        ++i;
+      }
+    };
+    cordova.exec(mycb, null, "SQLitePlugin", "backgroundExecuteSqlBatch", [
+      {
+        dbargs: {
+          dbname: this.db.dbname
+        },
+        flen: batchExecutes.length,
+        flatlist: flatlist
+      }
+    ]);
+  };
+
+  SQLitePluginTransaction.prototype.run_batch = function(batchExecutes, handlerFor) {
+    var i, mycb, mycbmap, request, tropts;
+    tropts = [];
+    mycbmap = {};
+    i = 0;
     while (i < batchExecutes.length) {
       request = batchExecutes[i];
       mycbmap[i] = {
@@ -442,9 +597,10 @@
       i++;
     }
     mycb = function(result) {
-      var j, last, q, r, ref, res, type;
-      last = result.length - 1;
-      for (i = j = 0, ref = last; 0 <= ref ? j <= ref : j >= ref; i = 0 <= ref ? ++j : --j) {
+      var q, r, res, reslength, type;
+      i = 0;
+      reslength = result.length;
+      while (i < reslength) {
         r = result[i];
         type = r.type;
         res = r.result;
@@ -454,6 +610,7 @@
             q[type](res);
           }
         }
+        ++i;
       }
     };
     cordova.exec(mycb, null, "SQLitePlugin", "backgroundExecuteSqlBatch", [
@@ -466,7 +623,7 @@
     ]);
   };
 
-  SQLitePluginTransaction.prototype.abort = function(txFailure) {
+  SQLitePluginTransaction.prototype.$abort = function(txFailure) {
     var failed, succeeded, tx;
     if (this.finalized) {
       return;
@@ -495,7 +652,7 @@
     }
   };
 
-  SQLitePluginTransaction.prototype.finish = function() {
+  SQLitePluginTransaction.prototype.$finish = function() {
     var failed, succeeded, tx;
     if (this.finalized) {
       return;
@@ -532,12 +689,6 @@
 
   dblocations = ["docs", "libs", "nosync"];
 
-  iosLocationMap = {
-    'default': 'nosync',
-    'Documents': 'docs',
-    'Library': 'libs'
-  };
-
   SQLiteFactory = {
 
     /*
@@ -546,58 +697,55 @@
     If this function is edited in Javascript then someone will
     have to translate it back to CoffeeScript by hand.
      */
-    openDatabase: argsArray(function(args) {
-      var dblocation, errorcb, okcb, openargs;
-      if (args.length < 1 || !args[0]) {
-        throw newSQLError('Sorry missing mandatory open arguments object in openDatabase call');
+    opendb: argsArray(function(args) {
+      var dblocation, errorcb, first, okcb, openargs;
+      if (args.length < 1) {
+        return null;
       }
-      if (args[0].constructor === String) {
-        throw newSQLError('Sorry first openDatabase argument must be an object');
+      first = args[0];
+      openargs = null;
+      okcb = null;
+      errorcb = null;
+      if (first.constructor === String) {
+        openargs = {
+          name: first
+        };
+        if (args.length >= 5) {
+          okcb = args[4];
+          if (args.length > 5) {
+            errorcb = args[5];
+          }
+        }
+      } else {
+        openargs = first;
+        if (args.length >= 2) {
+          okcb = args[1];
+          if (args.length > 2) {
+            errorcb = args[2];
+          }
+        }
       }
-      openargs = args[0];
-      if (!openargs.name) {
-        throw newSQLError('Database name value is missing in openDatabase call');
-      }
-      if (!openargs.iosDatabaseLocation && !openargs.location && openargs.location !== 0) {
-        throw newSQLError('Database location or iosDatabaseLocation value is now mandatory in openDatabase call');
-      }
-      dblocation = !!openargs.location && openargs.location === 'default' ? iosLocationMap['default'] : !!openargs.iosDatabaseLocation ? iosLocationMap[openargs.iosDatabaseLocation] : dblocations[openargs.location];
-      openargs.dblocation = dblocation;
+      dblocation = !!openargs.location ? dblocations[openargs.location] : null;
+      openargs.dblocation = dblocation || dblocations[0];
       if (!!openargs.createFromLocation && openargs.createFromLocation === 1) {
         openargs.createFromResource = "1";
       }
-      if (!!openargs.androidDatabaseImplementation && openargs.androidDatabaseImplementation === 2) {
-        openargs.androidOldDatabaseImplementation = 1;
-      }
-      if (!!openargs.androidLockWorkaround && openargs.androidLockWorkaround === 1) {
-        openargs.androidBugWorkaround = 1;
-      }
-      okcb = null;
-      errorcb = null;
-      if (args.length >= 2) {
-        okcb = args[1];
-        if (args.length > 2) {
-          errorcb = args[2];
-        }
-      }
       return new SQLitePlugin(openargs, okcb, errorcb);
     }),
-    deleteDatabase: function(first, success, error) {
+    deleteDb: function(first, success, error) {
       var args, dblocation;
       args = {};
       if (first.constructor === String) {
-        throw newSQLError('Sorry first deleteDatabase argument must be an object');
+        args.path = first;
+        args.dblocation = dblocations[0];
       } else {
         if (!(first && first['name'])) {
           throw new Error("Please specify db name");
         }
         args.path = first.name;
+        dblocation = !!first.location ? dblocations[first.location] : null;
+        args.dblocation = dblocation || dblocations[0];
       }
-      if (!first.iosDatabaseLocation && !first.location && first.location !== 0) {
-        throw newSQLError('Database location or iosDatabaseLocation value is now mandatory in deleteDatabase call');
-      }
-      dblocation = !!first.location && first.location === 'default' ? iosLocationMap['default'] : !!first.iosDatabaseLocation ? iosLocationMap[first.iosDatabaseLocation] : dblocations[first.location];
-      args.dblocation = dblocation;
       delete SQLitePlugin.prototype.openDBs[args.path];
       return cordova.exec(success, error, "SQLitePlugin", "delete", [args]);
     }
@@ -607,26 +755,8 @@
     sqliteFeatures: {
       isSQLitePlugin: true
     },
-    echoTest: function(okcb, errorcb) {
-      var error, ok;
-      ok = function(s) {
-        if (s === 'test-string') {
-          return okcb();
-        } else {
-          return errorcb("Mismatch: got: '" + s + "' expected 'test-string'");
-        }
-      };
-      error = function(e) {
-        return errorcb(e);
-      };
-      return cordova.exec(okcb, errorcb, "SQLitePlugin", "echoStringValue", [
-        {
-          value: 'test-string'
-        }
-      ]);
-    },
-    openDatabase: SQLiteFactory.openDatabase,
-    deleteDatabase: SQLiteFactory.deleteDatabase
+    openDatabase: SQLiteFactory.opendb,
+    deleteDatabase: SQLiteFactory.deleteDb
   };
 
 }).call(this);
